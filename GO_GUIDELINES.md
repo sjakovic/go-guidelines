@@ -69,14 +69,16 @@ No HTTP, no multi-tenancy, no authorization means no service layer. Use a flat `
 ├── cmd/<binary>/main.go     (or main.go at the root if the framework requires it)
 ├── internal/
 │   ├── app/                 the boundary: the only package that imports the UI/CLI framework
-│   ├── library/             orchestrator: holds the packages below and sequences them
-│   ├── scanner/             one capability per package
+│   ├── <orchestrator>/      owns the capability packages and sequences them
+│   ├── <capability>/        one package per thing the app does, named after what it does
+│   ├── <capability>/
 │   ├── store/               the only package with SQL
-│   ├── thumbs/
-│   ├── settings/
+│   ├── settings/            only if the app has user-editable settings
 │   └── testutil/            helpers shared by tests in more than one package
 └── go.mod
 ```
+
+Only `app`, `store` and `testutil` are fixed names. The orchestrator is named after the domain and the capability packages after what they do, so they differ in every project. In a photo library app the orchestrator is `library` and the capabilities are `scanner` and `thumbs`; in a backup tool they would be `backup`, `snapshot` and `upload`. Take the shape, not the names.
 
 ### 1.3 Library (importable module)
 
@@ -177,7 +179,7 @@ type AppError struct {
 - `ctx context.Context` is always the first parameter and is always called `ctx`.
 - Never store a context in a struct. Pass it.
 - Every function that does I/O, waits, or calls something that does, takes a context. In-memory implementations still check `ctx.Err()` so the habit is uniform.
-- Context values are for request-scoped identity only (user id, tenant id, request id). Use unexported key types and typed accessor functions (`respond.UserID(ctx)`). Never pass dependencies or business data through the context.
+- Context values are for request-scoped identity only (user id, request id, tenant id if any). Use unexported key types and typed accessor functions (`respond.UserID(ctx)`). Never pass dependencies or business data through the context.
 - Deadlines: HTTP server timeouts on the server, `context.WithTimeout` for outbound calls, cancellation propagated to background work.
 
 ---
@@ -211,7 +213,7 @@ type AppError struct {
 
 - Go 1.22+ `http.ServeMux` with method and path patterns (`"GET /invoices/{id}"`) for simple services. chi (or equivalent) only when route groups with different middleware stacks are needed.
 - One route table in `server.go`, grouped by area in `mount<Area>` functions. A reader finds every endpoint in one file.
-- Middleware is a function `http.Handler → http.Handler`. Order: recover, request id, logging, CORS, auth, tenant guard.
+- Middleware is a function `http.Handler → http.Handler`. Order: recover, request id, logging, CORS, auth, then any ownership guard (tenant or organization) if the app has one.
 
 ### 9.2 Handlers
 
@@ -246,13 +248,13 @@ func (h *Clients) Create(w http.ResponseWriter, r *http.Request) error {
 - Success: `{"data": ...}`.
 - List: `{"items": [...], "page": 1, "size": 25, "total": 140}`.
 - Error: `{"error": {"code": "validation_error", "message": "Invalid input", "fields": {"email": "must be a valid email"}}}`.
-- Status codes: 200 read/update, 201 create, 204 only when there is truly no body, 400 validation, 401 not signed in, 403 signed in but not allowed, 404 not found **and** cross-tenant access (never reveal existence), 409 conflict, 500 everything else.
+- Status codes: 200 read/update, 201 create, 204 only when there is truly no body, 400 validation, 401 not signed in, 403 signed in but not allowed, 404 not found **and** access to a resource owned by another user, organization or tenant (never reveal existence), 409 conflict, 500 everything else.
 
 ### 9.5 Pagination, filtering, identity
 
 - `?page=` and `?size=` with defaults (1, 25) and a hard cap (100), parsed in one helper.
 - Filters are explicit query parameters parsed in the handler into a typed input struct. No generic query languages.
-- Identity (user id, tenant id, roles) is placed in the context by the auth middleware and read through typed accessors. Handlers never read cookies or `Authorization` headers.
+- Identity (user id, roles, and the tenant or organization id if the app has one) is placed in the context by the auth middleware and read through typed accessors. Handlers never read cookies or `Authorization` headers.
 
 ### 9.6 Server settings
 
@@ -279,8 +281,8 @@ type DBTX interface {
 - Storage returns domain types and sentinel errors (`ErrNotFound`, `ErrConflict`). Never HTTP types, never driver errors unwrapped.
 - Columns are listed explicitly. No `SELECT *`. Keep a `const xColumns` and a `scanX` function per aggregate.
 - Parameters are numbered in order. One statement per function.
-- **Multi-tenant: every tenant query filters by the tenant id. No exceptions.** This is reviewed on every PR.
-- Raw SQL with the driver is the default. sqlc is acceptable for large schemas. ORMs are not used: they hide the query, and the tenant filter is the one thing that must never be hidden.
+- **Ownership filter. If data belongs to a user, organization or tenant, every query for it filters by that owner id. No exceptions.** This is reviewed on every PR.
+- Raw SQL with the driver is the default. sqlc is acceptable for large schemas. ORMs are not used: they hide the query, and the ownership filter is the one thing that must never be hidden.
 
 ### 10.2 Migrations
 
@@ -324,9 +326,9 @@ type DBTX interface {
 - Fixtures: builder functions in Go (`seed.Invoice().In(company).Build(t)`), not SQL fixture files that go stale silently.
 - `go test -race ./...` in CI. Flaky tests are fixed or deleted, never retried.
 
-### 11.3 The tenant isolation test
+### 11.3 The isolation test
 
-For every endpoint that takes a resource id: sign in as tenant A, create the resource, sign in as tenant B, request it, assert 404. This single pattern matters more than any coverage number.
+In any application where data has an owner (user, organization, tenant), for every endpoint that takes a resource id: sign in as A, create the resource, sign in as B, request it, assert 404. This single pattern matters more than any coverage number.
 
 ### 11.4 Coverage
 
@@ -488,11 +490,11 @@ The author confirms before requesting review:
 
 - [ ] `make check` passes locally (format, vet, lint, build, tests with `-race`).
 - [ ] No SQL outside `storage/`. No business rules in handlers. No HTTP types in services.
-- [ ] Every new tenant query filters by tenant id.
+- [ ] Every new query for owned data filters by the owner id (user, organization or tenant).
 - [ ] Every error is wrapped with context or deliberately handled; no `_ =` without a comment.
 - [ ] New interfaces are declared at the consumer and have at most three methods.
 - [ ] No new package-level mutable state, no `init()`, no stored contexts.
-- [ ] Domain and service changes have unit tests; new endpoints have `httptest` tests; new endpoints that take an id have the tenant isolation test.
+- [ ] Domain and service changes have unit tests; new endpoints have `httptest` tests; new endpoints that take an id have the isolation test.
 - [ ] Migrations are new files; no applied migration was edited.
 - [ ] New dependencies are listed in the PR description with their justification.
 - [ ] Size limits respected; no lint exclusions added without a removal plan.
@@ -606,7 +608,7 @@ func TestService_Create(t *testing.T) {
 | Logging | `slog`, structured, at the edge, once per failure |
 | Concurrency | clear owner, sender closes, bounded pools, `-race` |
 | Handlers | decode, one service call, encode; return `error`; 40 lines |
-| Storage | all SQL here; `DBTX`; explicit columns; tenant filter always |
+| Storage | all SQL here; `DBTX`; explicit columns; ownership filter always |
 | Money / time / ids | `decimal` / UTC / string |
 | Tests | next to code; table-driven; fakes not mocks; isolation test |
 | Limits | file 400, func 60, handler 40, params 5, complexity 15 |
